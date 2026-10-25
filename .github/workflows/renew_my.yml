@@ -1,0 +1,198 @@
+name: 新版 Auto Renew Bot-hosting
+
+on:
+  schedule:
+    - cron: '30 22 * * *' # 每天UTC 1点 (北京时间9点, 一般都会推迟),自行根据服务到期时间调整
+  workflow_dispatch:
+
+jobs:
+  Renew-bot:
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: ⚙ 设置 Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: 🛠️ 安装系统依赖和 Python 依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk jq wget
+          pip install seleniumbase requests
+          seleniumbase install chromedriver
+
+      - name: ⚙ 设置代理 (sing-box)
+        continue-on-error: true
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: |
+          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+
+      - name: 🚀 运行续期脚本
+        env:
+          EMAIL: ${{ secrets.EMAIL }}
+          PASSWORD: ${{ secrets.PASSWORD }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        # 日志落盘 /tmp/run.log，供后续「解析结果」与「邮件通知」步骤使用
+        # pipefail 保证 app.py 异常退出时本步骤仍然失败(红色)
+        run: |
+          set -o pipefail
+          xvfb-run --auto-servernum python3 app.py 2>&1 | tee /tmp/run.log
+
+      - name: 🔎 解析续期结果
+        id: result
+        if: always()
+        run: |
+          log=/tmp/run.log
+          touch "$log"
+          # 续期成功 或 续期冷却中(未到续期时间) 都算成功，避免每天误报失败
+          if grep -qF '✅ 续期成功' "$log"; then
+            echo "result=success" >> "$GITHUB_OUTPUT"
+            echo "detail=续期成功" >> "$GITHUB_OUTPUT"
+          elif grep -qF '未到续期时间，倒计时' "$log"; then
+            echo "result=success" >> "$GITHUB_OUTPUT"
+            echo "detail=未到续期时间" >> "$GITHUB_OUTPUT"
+          elif grep -qF '❌ Password 登录' "$log"; then
+            echo "result=failed" >> "$GITHUB_OUTPUT"
+            echo "detail=登录失败" >> "$GITHUB_OUTPUT"
+          elif grep -qF '续期结果未知' "$log"; then
+            echo "result=warning" >> "$GITHUB_OUTPUT"
+            echo "detail=续期结果未知，请手动检查" >> "$GITHUB_OUTPUT"
+          elif grep -qF '未找到续期按钮或倒计时' "$log"; then
+            echo "result=warning" >> "$GITHUB_OUTPUT"
+            echo "detail=未找到续期按钮，状态未知" >> "$GITHUB_OUTPUT"
+          elif grep -qF 'Turnstile 验证最终未通过' "$log"; then
+            echo "result=failed" >> "$GITHUB_OUTPUT"
+            echo "detail=Turnstile 验证未通过" >> "$GITHUB_OUTPUT"
+          elif grep -qF '点击外部按钮失败' "$log"; then
+            echo "result=failed" >> "$GITHUB_OUTPUT"
+            echo "detail=点击续期按钮失败" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=failed" >> "$GITHUB_OUTPUT"
+            echo "detail=续期失败(日志无明确结果)" >> "$GITHUB_OUTPUT"
+          fi
+          echo "--- result ---"
+          cat "$GITHUB_OUTPUT"
+
+      # ── 邮件通知 ──
+      # SMTP 凭证复用 lunes 同名 Secret；未配置时跳过，不影响工作流状态
+      - name: 📧 发送邮件通知
+        if: always()
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_TO: ${{ secrets.SMTP_TO }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          RENEW_RESULT: ${{ steps.result.outputs.result }}
+          RENEW_DETAIL: ${{ steps.result.outputs.detail }}
+        run: |
+          python3 - "${{ github.run_number }}" "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" <<'PYEOF'
+          import os, re, sys, smtplib
+          from email.mime.text import MIMEText
+          from datetime import datetime, timezone, timedelta
+
+          run_num, run_url = sys.argv[1], sys.argv[2]
+
+          smtp_user = os.environ.get("SMTP_USER", "")
+          smtp_pass = os.environ.get("SMTP_PASSWORD", "")
+          smtp_to   = os.environ.get("SMTP_TO", "") or smtp_user
+          if not (smtp_user and smtp_pass and smtp_to):
+              print("⚠️ SMTP 未配置，跳过邮件通知")
+              sys.exit(0)
+
+          result = (os.environ.get("RENEW_RESULT") or "unknown").strip()
+          detail = (os.environ.get("RENEW_DETAIL") or "-").strip()
+          if result == "success":
+              emoji, label = "✅", "SUCCESS"
+          elif result == "warning":
+              emoji, label = "⚠️", "WARNING"
+          else:
+              emoji, label = "❌", "FAILED"
+
+          bj = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M CST")
+
+          log = ""
+          try:
+              with open("/tmp/run.log", encoding="utf-8", errors="replace") as f:
+                  log = f.read()
+          except Exception:
+              log = "No log available"
+
+          def pick(pattern, default=""):
+              m = re.search(pattern, log)
+              return m.group(1).strip() if m else default
+
+          expiry_old = pick(r"当前到期日期:\s*(\S+)")
+          expiry_new = pick(r"新的到期日期:\s*(\S+)")
+          expiry = expiry_new or expiry_old or "-"
+          m = re.search(r"倒计时:\s*(\d{1,2}:\d{2}:\d{2})\s*\(([^)]+)\)", log)
+          cooldown = f"{m.group(1)} ({m.group(2)})" if m else "-"
+          new_cd = pick(r"新的倒计时:\s*(\d{1,2}:\d{2}:\d{2})")
+
+          body = "\n".join([
+              "Bot-hosting 自动续期 Report",
+              "==========================",
+              f"Result:   {label} ({detail})",
+              f"Expiry:   {expiry}",
+              f"Cooldown: {cooldown}" + (f" / new {new_cd}" if new_cd else ""),
+              f"Run:      #{run_num}",
+              f"Time:     {bj}",
+              f"Workflow: {run_url}",
+              "",
+              "--- Run Log ---",
+              log,
+          ])
+
+          msg = MIMEText(body, "plain", "utf-8")
+          msg["From"] = smtp_user
+          msg["To"] = smtp_to
+          msg["Subject"] = f"{emoji} Bot-hosting 续期: {label} ({detail}) (#{run_num})"
+
+          smtp_host = os.environ.get("SMTP_HOST") or "smtp.gmail.com"
+          smtp_port = int(os.environ.get("SMTP_PORT") or "465")
+          try:
+              if smtp_port == 465:
+                  with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=30) as s:
+                      s.login(smtp_user, smtp_pass)
+                      s.send_message(msg)
+              else:
+                  with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as s:
+                      s.starttls()
+                      s.login(smtp_user, smtp_pass)
+                      s.send_message(msg)
+              print(f"[+] Email sent: {label} ({detail})")
+          except Exception as e:
+              print(f"❌ 邮件发送失败: {type(e).__name__}: {e}")
+          PYEOF
+
+      - name: 🧽 清理进程和临时文件
+        if: always()
+        run: |
+          pkill -f sing-box || true
+          pkill -f chromedriver || true
+          pkill -f chrome || true
+          pkill -f Xvfb || true
+          rm -f sing-box sing-box-config.json sing-box.log
+
+      - name: 🧹 清理旧的工作流运行记录
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
+          count=0
+          for run_id in $runs; do
+            count=$((count + 1))
+            if [ $count -gt 1 ]; then
+              echo "删除运行记录: $run_id"
+              gh run delete $run_id || true
+            fi
+          done
